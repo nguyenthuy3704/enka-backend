@@ -1,7 +1,23 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 import enka
 
 app = FastAPI()
+
+# Thiết lập CORS cho các origin được phép
+origins = [
+    "http://127.0.0.1:5500",
+    "http://127.0.0.1:5501",
+    "https://meostore.shop"
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Tạo client cho 3 game
 genshin_client = enka.GenshinClient(enka.gi.Language.ENGLISH)
@@ -20,7 +36,7 @@ async def shutdown():
     await hsr_client.__aexit__(None, None, None)
     await zzz_client.__aexit__(None, None, None)
 
-# Tự động nhận diện game từ UID
+# Nhận diện game từ UID
 def detect_game(uid: int):
     uid_str = str(uid)
     if uid_str.startswith("6") and len(uid_str) == 9:
@@ -29,27 +45,27 @@ def detect_game(uid: int):
         return "zzz"
     elif len(uid_str) == 9:
         return "gi"
-    else:
-        return None
+    return None
+
+# Hàm fetch dữ liệu chung
+async def fetch_showcase(game: str, uid: int):
+    if game == "gi":
+        return await genshin_client.fetch_showcase(uid)
+    if game == "hsr":
+        return await hsr_client.fetch_showcase(uid)
+    if game == "zzz":
+        return await zzz_client.fetch_showcase(uid)
+    raise HTTPException(status_code=400, detail="Invalid game detection")
 
 # Route tự động nhận diện game
 @app.get("/enka/{uid}")
 async def get_enka_data(uid: int):
     game = detect_game(uid)
-    if game is None:
+    if not game:
         raise HTTPException(status_code=400, detail="Unknown UID format")
-
     try:
-        if game == "gi":
-            data = await genshin_client.fetch_showcase(uid)
-        elif game == "hsr":
-            data = await hsr_client.fetch_showcase(uid)
-        elif game == "zzz":
-            data = await zzz_client.fetch_showcase(uid)
-        else:
-            raise HTTPException(status_code=400, detail="Invalid game detection")
-        
-        return data.model_dump()  # Trả toàn bộ JSON của Enka
+        data = await fetch_showcase(game, uid)
+        return data.model_dump()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -57,7 +73,7 @@ async def get_enka_data(uid: int):
 @app.get("/gi/{uid}")
 async def get_genshin(uid: int):
     try:
-        data = await genshin_client.fetch_showcase(uid)
+        data = await fetch_showcase("gi", uid)
         return data.model_dump()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -66,7 +82,7 @@ async def get_genshin(uid: int):
 @app.get("/hsr/{uid}")
 async def get_hsr(uid: int):
     try:
-        data = await hsr_client.fetch_showcase(uid)
+        data = await fetch_showcase("hsr", uid)
         return data.model_dump()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -75,7 +91,7 @@ async def get_hsr(uid: int):
 @app.get("/zzz/{uid}")
 async def get_zzz(uid: int):
     try:
-        data = await zzz_client.fetch_showcase(uid)
+        data = await fetch_showcase("zzz", uid)
         return data.model_dump()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
