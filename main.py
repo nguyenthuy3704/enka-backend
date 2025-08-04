@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import enka
 
-app = FastAPI()
+app = FastAPI(redirect_slashes=False)
 
 # Thiết lập CORS cho các origin được phép
 origins = [
@@ -100,9 +100,9 @@ async def get_zzz(uid: int):
 from fastapi.responses import PlainTextResponse
 from fastapi.requests import Request
 
-@app.api_route("/ping", methods=["GET", "HEAD"])
+@app.api_route("/ping", methods=["GET","HEAD"], include_in_schema=False)
+@app.api_route("/ping/", methods=["GET","HEAD"], include_in_schema=False)
 async def ping(request: Request):
-    # Trả về status 200 mà không cần nội dung nếu là HEAD
     if request.method == "HEAD":
         return PlainTextResponse(status_code=200)
     return PlainTextResponse("pong", status_code=200)
