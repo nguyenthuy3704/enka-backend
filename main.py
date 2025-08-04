@@ -95,3 +95,15 @@ async def get_zzz(uid: int):
         return data.model_dump()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+from fastapi.responses import PlainTextResponse
+from fastapi.requests import Request
+
+@app.api_route("/ping", methods=["GET", "HEAD"])
+async def ping(request: Request):
+    # Trả về status 200 mà không cần nội dung nếu là HEAD
+    if request.method == "HEAD":
+        return PlainTextResponse(status_code=200)
+    return PlainTextResponse("pong", status_code=200)
+    
