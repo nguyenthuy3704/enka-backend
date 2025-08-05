@@ -106,4 +106,28 @@ async def ping(request: Request):
     if request.method == "HEAD":
         return PlainTextResponse(status_code=200)
     return PlainTextResponse("pong", status_code=200)
-    
+
+
+import httpx
+
+@app.get("/idv/{roleid}")
+async def get_identityv_data(roleid: int):
+    url = f"https://pay.neteasegames.com/gameclub/identityv/2001/login-role"
+    params = {
+        "roleid": roleid,
+        "client_type": "gameclub"
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    }
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(url, params=params, headers=headers)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
