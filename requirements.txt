@@ -25,3 +25,4 @@ fastapi
 uvicorn
 flask
 gunicorn
+httpx
