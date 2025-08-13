@@ -1,8 +1,8 @@
 import asyncio
 import os
-import json
 import time
 import uvloop
+import orjson
 
 from collections import defaultdict
 from fastapi import FastAPI, HTTPException, Request
@@ -18,9 +18,9 @@ import redis.asyncio as redis
 uvloop.install()
 
 CACHE_TTL = {
-    "gi": 300,   # 5 phút
-    "hsr": 300,  # 5 phút
-    "zzz": 900   # 15 phút
+    "gi": 300,
+    "hsr": 300,
+    "zzz": 900
 }
 RETRY_COUNT = 2
 
@@ -44,7 +44,6 @@ if not REDIS_URL:
 
 app = FastAPI(redirect_slashes=False)
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -53,7 +52,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# GZip
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # ==================== GLOBAL CLIENTS ====================
@@ -67,7 +65,7 @@ idv_client: httpx.AsyncClient | None = None
 redis_client = redis.from_url(
     REDIS_URL,
     encoding="utf-8",
-    decode_responses=True
+    decode_responses=False  # lưu dạng bytes cho tốc độ
 )
 
 fetch_locks = defaultdict(asyncio.Lock)
@@ -106,6 +104,12 @@ async def on_shutdown():
 
 # ==================== UTILS ====================
 
+def to_json_bytes(obj):
+    return orjson.dumps(obj, option=orjson.OPT_NAIVE_UTC)
+
+def from_json_bytes(data):
+    return orjson.loads(data)
+
 async def fetch_with_retry(client_func, uid: int, game: str):
     last_error = None
     for attempt in range(1, RETRY_COUNT + 2):
@@ -127,20 +131,18 @@ async def fetch_showcase(game: str, uid: int):
     key = f"{game}:{uid}"
     ttl = CACHE_TTL.get(game, 300)
 
-    # Lấy cache từ Redis
-    cached_json = await redis_client.get(key)
-    if cached_json:
+    cached = await redis_client.get(key)
+    if cached:
         try:
-            return json.loads(cached_json)
+            return from_json_bytes(cached)
         except Exception:
             print(f"[CACHE ERROR] {key} parse failed, refetching...")
 
     async with fetch_locks[key]:
-        # Double check cache trong lock
-        cached_json = await redis_client.get(key)
-        if cached_json:
+        cached = await redis_client.get(key)
+        if cached:
             try:
-                return json.loads(cached_json)
+                return from_json_bytes(cached)
             except Exception:
                 pass
 
@@ -153,12 +155,12 @@ async def fetch_showcase(game: str, uid: int):
         try:
             data = await fetch_with_retry(client_map[game], uid, game)
             data_dict = data.model_dump()
-            await redis_client.setex(key, ttl, json.dumps(data_dict))
+            await redis_client.setex(key, ttl, to_json_bytes(data_dict))
             return data_dict
         except Exception as e:
-            if cached_json:
+            if cached:
                 print(f"[FALLBACK CACHE] {key}")
-                return json.loads(cached_json)
+                return from_json_bytes(cached)
             raise HTTPException(status_code=500, detail=str(e))
 
 async def preload_showcases(uid_list):
@@ -205,12 +207,11 @@ async def get_enka(game: str, uid: int):
 @app.get("/idv/{roleid}")
 async def get_idv(roleid: int):
     key = f"idv:{roleid}"
-    ttl = 300  # 5 phút
+    ttl = 300
 
-    # Check cache
     cached = await redis_client.get(key)
     if cached:
-        return json.loads(cached)
+        return from_json_bytes(cached)
 
     url = "https://pay.neteasegames.com/gameclub/identityv/2001/login-role"
     params = {"roleid": roleid, "client_type": "gameclub"}
@@ -224,10 +225,7 @@ async def get_idv(roleid: int):
         print(f"[IDV] RoleID {roleid} in {elapsed}s")
 
         data = response.json()
-
-        # Lưu cache
-        await redis_client.setex(key, ttl, json.dumps(data))
-
+        await redis_client.setex(key, ttl, to_json_bytes(data))
         return data
     except httpx.HTTPStatusError as e:
         raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
