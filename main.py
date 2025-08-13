@@ -85,12 +85,10 @@ async def fetch_showcase(game: str, uid: int):
 
         client = await get_client(game)
 
-        # Đo thời gian fetch
         start = time.time()
         try:
-            data = await asyncio.wait_for(client.fetch_showcase(uid), timeout=6)
-        except asyncio.TimeoutError:
-            raise HTTPException(status_code=504, detail="Fetch from Enka.network timed out")
+            # Không giới hạn thời gian chờ
+            data = await client.fetch_showcase(uid)
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
@@ -122,7 +120,7 @@ async def preload_clients_background():
         ("hsr", 600000000),
         ("zzz", 100000000)
     ]
-    await asyncio.sleep(1)  # Chờ server ổn định
+    await asyncio.sleep(1)
     print("[PRELOAD] Start preloading assets...")
     tasks = [fetch_showcase(game, uid) for game, uid in preload_uids]
     try:
