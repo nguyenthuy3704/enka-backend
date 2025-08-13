@@ -27,8 +27,8 @@ app.add_middleware(
 # ===== Gzip Compression =====
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-# ===== Persistent HTTP client cho API Identity V =====
-httpx_client = httpx.AsyncClient(timeout=8)
+# ===== HTTP client cho API Identity V =====
+httpx_client = httpx.AsyncClient(timeout=None)  # Không giới hạn timeout
 
 # ===== Lazy load Enka clients =====
 genshin_client = None
@@ -36,7 +36,6 @@ hsr_client = None
 zzz_client = None
 
 async def get_client(game: str):
-    """Khởi tạo client khi cần (enka tự quản lý HTTP session)"""
     global genshin_client, hsr_client, zzz_client
     if game == "gi":
         if genshin_client is None:
@@ -56,15 +55,9 @@ async def get_client(game: str):
     else:
         raise HTTPException(status_code=400, detail="Invalid game")
 
-# ===== Cache UID =====
+# ===== Cache =====
 cache_data = {}
-CACHE_TTL = {
-    "gi": 300,   # 5 phút
-    "hsr": 300,  # 5 phút
-    "zzz": 900   # 15 phút
-}
-
-# ===== Lock tránh gọi API trùng =====
+CACHE_TTL = {"gi": 300, "hsr": 300, "zzz": 900}
 fetch_locks = defaultdict(asyncio.Lock)
 
 async def fetch_showcase(game: str, uid: int):
@@ -72,25 +65,30 @@ async def fetch_showcase(game: str, uid: int):
     key = f"{game}:{uid}"
     ttl = CACHE_TTL.get(game, 300)
 
-    # Nếu cache còn hạn → trả luôn
+    # Trả cache nếu còn hạn
     if key in cache_data and now - cache_data[key]["time"] < ttl:
         print(f"[CACHE] {game.upper()} UID {uid} trả từ cache")
         return cache_data[key]["data"]
 
     async with fetch_locks[key]:
-        # Kiểm tra lại cache sau khi chờ
+        # Kiểm tra lại cache sau khi đợi lock
         if key in cache_data and now - cache_data[key]["time"] < ttl:
-            print(f"[CACHE] {game.upper()} UID {uid} trả từ cache sau khi chờ lock")
+            print(f"[CACHE] {game.upper()} UID {uid} trả từ cache sau lock")
             return cache_data[key]["data"]
 
         client = await get_client(game)
-
         start = time.time()
         try:
-            # Không giới hạn thời gian chờ
-            data = await client.fetch_showcase(uid)
+            data = await client.fetch_showcase(uid)  # Không giới hạn thời gian chờ
+        except enka.errors.NotFound:
+            raise HTTPException(status_code=404, detail=f"UID {uid} not found on Enka")
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            # Nếu có cache thì trả cache cũ
+            if key in cache_data:
+                print(f"[ERROR] {e} → dùng cache cũ cho {uid}")
+                return cache_data[key]["data"]
+            # Không có cache → trả lỗi 502 (lỗi upstream)
+            raise HTTPException(status_code=502, detail=f"Enka API error: {str(e)}")
 
         elapsed = round(time.time() - start, 3)
         print(f"[FETCH] {game.upper()} UID {uid} fetched in {elapsed}s")
@@ -98,7 +96,7 @@ async def fetch_showcase(game: str, uid: int):
         cache_data[key] = {"data": data, "time": time.time()}
         return data
 
-# ===== Nhận diện game từ UID =====
+# ===== Nhận diện game =====
 def detect_game(uid: int):
     s = str(uid)
     if s.startswith("6") and len(s) == 9:
@@ -109,22 +107,21 @@ def detect_game(uid: int):
         return "gi"
     return None
 
-# ===== Preload assets chạy nền khi startup =====
+# ===== Preload =====
 @app.on_event("startup")
 async def warmup():
     asyncio.create_task(preload_clients_background())
 
 async def preload_clients_background():
     preload_uids = [
-        ("gi", 800000000),  # UID thật/test
+        ("gi", 800000000),
         ("hsr", 600000000),
         ("zzz", 100000000)
     ]
     await asyncio.sleep(1)
     print("[PRELOAD] Start preloading assets...")
-    tasks = [fetch_showcase(game, uid) for game, uid in preload_uids]
     try:
-        await asyncio.gather(*tasks)
+        await asyncio.gather(*[fetch_showcase(game, uid) for game, uid in preload_uids])
         print("[PRELOAD] Completed")
     except Exception as e:
         print(f"[PRELOAD] Error: {e}")
@@ -135,7 +132,6 @@ async def root():
     return {"status": "ok", "message": "Enka backend is running"}
 
 @app.api_route("/ping", methods=["GET", "HEAD"], include_in_schema=False)
-@app.api_route("/ping/", methods=["GET", "HEAD"], include_in_schema=False)
 async def ping(request: Request):
     if request.method == "HEAD":
         return PlainTextResponse(status_code=200)
@@ -169,12 +165,12 @@ async def get_idv(roleid: int):
 
     try:
         start = time.time()
-        response = await httpx_client.get(url, params=params, headers=headers)
+        response = await httpx_client.get(url, params=params, headers=headers)  # không timeout
         response.raise_for_status()
         elapsed = round(time.time() - start, 3)
         print(f"[IDV] RoleID {roleid} fetched in {elapsed}s")
         return response.json()
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=500, detail=f"Request error: {str(e)}")
     except httpx.HTTPStatusError as e:
         raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Identity V API error: {str(e)}")
