@@ -28,3 +28,5 @@ gunicorn
 httpx
 uvloop
 httptools
+redis[asyncio]
+
