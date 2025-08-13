@@ -1,13 +1,13 @@
 # main.py
+import asyncio
+import time
+from collections import defaultdict
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import PlainTextResponse
 import enka
 import httpx
-import asyncio
-import time
-from collections import defaultdict
 
 # ==================== CONFIG ====================
 CACHE_TTL = {
@@ -23,9 +23,17 @@ ALLOWED_ORIGINS = [
     "https://meostore.shop"
 ]
 
+# UID preload khi startup (tùy bạn sửa)
+PRELOAD_UIDS = [
+    ("gi", 800000000),
+    ("hsr", 600000000),
+    ("zzz", 100000000)
+]
+
 # ==================== APP ====================
 app = FastAPI(redirect_slashes=False)
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -34,6 +42,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# GZip giảm dung lượng trả về
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # ==================== GLOBALS ====================
@@ -41,23 +50,32 @@ genshin_client = enka.GenshinClient(enka.gi.Language.ENGLISH)
 hsr_client = enka.HSRClient(enka.hsr.Language.ENGLISH)
 zzz_client = enka.ZZZClient(enka.zzz.Language.ENGLISH)
 
+# HTTPX client giữ kết nối cho Identity V
+idv_client = httpx.AsyncClient(timeout=15)
+
+# Cache & Lock tránh fetch trùng
 cache_data = {}
 fetch_locks = defaultdict(asyncio.Lock)
 
 # ==================== STARTUP / SHUTDOWN ====================
 @app.on_event("startup")
 async def startup_event():
+    # Khởi tạo kết nối Enka
     await genshin_client.__aenter__()
     await hsr_client.__aenter__()
     await zzz_client.__aenter__()
     print("[STARTUP] Enka clients ready.")
+
+    # Preload UID hay dùng
+    asyncio.create_task(preload_showcases(PRELOAD_UIDS))
 
 @app.on_event("shutdown")
 async def shutdown_event():
     await genshin_client.__aexit__(None, None, None)
     await hsr_client.__aexit__(None, None, None)
     await zzz_client.__aexit__(None, None, None)
-    print("[SHUTDOWN] Enka clients closed.")
+    await idv_client.aclose()
+    print("[SHUTDOWN] All clients closed.")
 
 # ==================== UTILS ====================
 def detect_game(uid: int):
@@ -71,9 +89,8 @@ def detect_game(uid: int):
     return None
 
 async def fetch_with_retry(client_func, uid: int, game: str):
-    """Fetch showcase với retry + cache fallback"""
     last_error = None
-    for attempt in range(1, RETRY_COUNT + 2):  # lần cuối là lần thật sự cuối
+    for attempt in range(1, RETRY_COUNT + 2):
         try:
             start = time.time()
             data = await client_func(uid)
@@ -93,12 +110,11 @@ async def fetch_showcase(game: str, uid: int):
     ttl = CACHE_TTL.get(game, 300)
     now = time.time()
 
-    # Cache còn hạn → trả ngay
+    # Cache còn hạn
     if key in cache_data and now - cache_data[key]["time"] < ttl:
         return cache_data[key]["data"]
 
     async with fetch_locks[key]:
-        # Kiểm tra lại cache sau khi chờ lock
         if key in cache_data and now - cache_data[key]["time"] < ttl:
             return cache_data[key]["data"]
 
@@ -113,11 +129,18 @@ async def fetch_showcase(game: str, uid: int):
             cache_data[key] = {"data": data, "time": time.time()}
             return data
         except Exception as e:
-            # Nếu lỗi nhưng cache cũ còn → trả cache
             if key in cache_data:
                 print(f"[FALLBACK CACHE] {game.upper()} UID {uid}")
                 return cache_data[key]["data"]
             raise HTTPException(status_code=500, detail=str(e))
+
+async def preload_showcases(uid_list):
+    for game, uid in uid_list:
+        try:
+            await fetch_showcase(game, uid)
+            print(f"[PRELOAD] {game.upper()} {uid} OK")
+        except Exception as e:
+            print(f"[PRELOAD] {game.upper()} {uid} FAILED: {e}")
 
 # ==================== ROUTES ====================
 @app.get("/")
@@ -156,15 +179,14 @@ async def get_idv(roleid: int):
     params = {"roleid": roleid, "client_type": "gameclub"}
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        try:
-            start = time.time()
-            response = await client.get(url, params=params, headers=headers)
-            response.raise_for_status()
-            elapsed = round(time.time() - start, 3)
-            print(f"[IDV] RoleID {roleid} in {elapsed}s")
-            return response.json()
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
-        except httpx.RequestError as e:
-            raise HTTPException(status_code=500, detail=f"Request error: {str(e)}")
+    try:
+        start = time.time()
+        response = await idv_client.get(url, params=params, headers=headers)
+        response.raise_for_status()
+        elapsed = round(time.time() - start, 3)
+        print(f"[IDV] RoleID {roleid} in {elapsed}s")
+        return response.json()
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=500, detail=f"Request error: {str(e)}")
