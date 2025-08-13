@@ -2,6 +2,9 @@ import asyncio
 import time
 import json
 import os
+import uvloop
+uvloop.install()
+
 from collections import defaultdict
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
