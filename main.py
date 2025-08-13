@@ -1,6 +1,7 @@
-# main.py
 import asyncio
 import time
+import json
+import os
 from collections import defaultdict
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,6 +9,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import PlainTextResponse
 import enka
 import httpx
+import redis.asyncio as redis  # Redis async client
 
 # ==================== CONFIG ====================
 CACHE_TTL = {
@@ -23,12 +25,13 @@ ALLOWED_ORIGINS = [
     "https://meostore.shop"
 ]
 
-# UID preload khi startup (tùy bạn sửa)
 PRELOAD_UIDS = [
     ("gi", 800000000),
     ("hsr", 600000000),
     ("zzz", 100000000)
 ]
+
+REDIS_URL = os.getenv("REDIS_URL")  # Lấy từ biến môi trường Render
 
 # ==================== APP ====================
 app = FastAPI(redirect_slashes=False)
@@ -42,7 +45,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# GZip giảm dung lượng trả về
+# GZip
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # ==================== GLOBALS ====================
@@ -50,24 +53,34 @@ genshin_client = enka.GenshinClient(enka.gi.Language.ENGLISH)
 hsr_client = enka.HSRClient(enka.hsr.Language.ENGLISH)
 zzz_client = enka.ZZZClient(enka.zzz.Language.ENGLISH)
 
-# HTTPX client giữ kết nối cho Identity V
 idv_client = httpx.AsyncClient(timeout=15)
 
-# Cache & Lock tránh fetch trùng
-cache_data = {}
+redis_client = redis.from_url(
+    REDIS_URL,
+    encoding="utf-8",
+    decode_responses=True
+)
+
 fetch_locks = defaultdict(asyncio.Lock)
 
 # ==================== STARTUP / SHUTDOWN ====================
 @app.on_event("startup")
 async def startup_event():
-    # Khởi tạo kết nối Enka
+    # Kết nối Enka
     await genshin_client.__aenter__()
     await hsr_client.__aenter__()
     await zzz_client.__aenter__()
-    print("[STARTUP] Enka clients ready.")
 
-    # Preload UID hay dùng
+    # Test Redis
+    try:
+        pong = await redis_client.ping()
+        print(f"[REDIS] Connected: {pong}")
+    except Exception as e:
+        print(f"[REDIS] Connection failed: {e}")
+
+    # Preload
     asyncio.create_task(preload_showcases(PRELOAD_UIDS))
+    print("[STARTUP] Enka clients ready.")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -75,6 +88,7 @@ async def shutdown_event():
     await hsr_client.__aexit__(None, None, None)
     await zzz_client.__aexit__(None, None, None)
     await idv_client.aclose()
+    await redis_client.aclose()
     print("[SHUTDOWN] All clients closed.")
 
 # ==================== UTILS ====================
@@ -108,15 +122,24 @@ async def fetch_with_retry(client_func, uid: int, game: str):
 async def fetch_showcase(game: str, uid: int):
     key = f"{game}:{uid}"
     ttl = CACHE_TTL.get(game, 300)
-    now = time.time()
 
-    # Cache còn hạn
-    if key in cache_data and now - cache_data[key]["time"] < ttl:
-        return cache_data[key]["data"]
+    # Lấy cache từ Redis
+    cached_json = await redis_client.get(key)
+    if cached_json:
+        try:
+            data_dict = json.loads(cached_json)
+            return enka.models.Showcase(**data_dict)
+        except Exception:
+            print(f"[CACHE ERROR] {key} parse failed, refetching...")
 
     async with fetch_locks[key]:
-        if key in cache_data and now - cache_data[key]["time"] < ttl:
-            return cache_data[key]["data"]
+        cached_json = await redis_client.get(key)
+        if cached_json:
+            try:
+                data_dict = json.loads(cached_json)
+                return enka.models.Showcase(**data_dict)
+            except Exception:
+                pass
 
         client_map = {
             "gi": genshin_client.fetch_showcase,
@@ -126,12 +149,12 @@ async def fetch_showcase(game: str, uid: int):
 
         try:
             data = await fetch_with_retry(client_map[game], uid, game)
-            cache_data[key] = {"data": data, "time": time.time()}
+            await redis_client.setex(key, ttl, json.dumps(data.model_dump()))
             return data
         except Exception as e:
-            if key in cache_data:
-                print(f"[FALLBACK CACHE] {game.upper()} UID {uid}")
-                return cache_data[key]["data"]
+            if cached_json:
+                print(f"[FALLBACK CACHE] {key}")
+                return enka.models.Showcase(**json.loads(cached_json))
             raise HTTPException(status_code=500, detail=str(e))
 
 async def preload_showcases(uid_list):
