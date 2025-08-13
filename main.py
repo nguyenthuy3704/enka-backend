@@ -1,102 +1,65 @@
+# main.py
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
 from fastapi.middleware.gzip import GZipMiddleware
-import time
+from fastapi.responses import PlainTextResponse
+import enka
 import httpx
 import asyncio
-import enka
+import time
 from collections import defaultdict
 
-app = FastAPI(redirect_slashes=False)
+# ==================== CONFIG ====================
+CACHE_TTL = {
+    "gi": 300,   # 5 phút
+    "hsr": 300,  # 5 phút
+    "zzz": 900   # 15 phút
+}
+RETRY_COUNT = 2
 
-# ===== CORS =====
-origins = [
+ALLOWED_ORIGINS = [
     "http://127.0.0.1:5500",
     "http://127.0.0.1:5501",
     "https://meostore.shop"
 ]
+
+# ==================== APP ====================
+app = FastAPI(redirect_slashes=False)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ===== Gzip Compression =====
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-# ===== HTTP client cho API Identity V =====
-httpx_client = httpx.AsyncClient(timeout=None)  # Không giới hạn timeout
+# ==================== GLOBALS ====================
+genshin_client = enka.GenshinClient(enka.gi.Language.ENGLISH)
+hsr_client = enka.HSRClient(enka.hsr.Language.ENGLISH)
+zzz_client = enka.ZZZClient(enka.zzz.Language.ENGLISH)
 
-# ===== Lazy load Enka clients =====
-genshin_client = None
-hsr_client = None
-zzz_client = None
-
-async def get_client(game: str):
-    global genshin_client, hsr_client, zzz_client
-    if game == "gi":
-        if genshin_client is None:
-            genshin_client = enka.GenshinClient(enka.gi.Language.ENGLISH)
-            await genshin_client.__aenter__()
-        return genshin_client
-    elif game == "hsr":
-        if hsr_client is None:
-            hsr_client = enka.HSRClient(enka.hsr.Language.ENGLISH)
-            await hsr_client.__aenter__()
-        return hsr_client
-    elif game == "zzz":
-        if zzz_client is None:
-            zzz_client = enka.ZZZClient(enka.zzz.Language.ENGLISH)
-            await zzz_client.__aenter__()
-        return zzz_client
-    else:
-        raise HTTPException(status_code=400, detail="Invalid game")
-
-# ===== Cache =====
 cache_data = {}
-CACHE_TTL = {"gi": 300, "hsr": 300, "zzz": 900}
 fetch_locks = defaultdict(asyncio.Lock)
 
-async def fetch_showcase(game: str, uid: int):
-    now = time.time()
-    key = f"{game}:{uid}"
-    ttl = CACHE_TTL.get(game, 300)
+# ==================== STARTUP / SHUTDOWN ====================
+@app.on_event("startup")
+async def startup_event():
+    await genshin_client.__aenter__()
+    await hsr_client.__aenter__()
+    await zzz_client.__aenter__()
+    print("[STARTUP] Enka clients ready.")
 
-    # Trả cache nếu còn hạn
-    if key in cache_data and now - cache_data[key]["time"] < ttl:
-        print(f"[CACHE] {game.upper()} UID {uid} trả từ cache")
-        return cache_data[key]["data"]
+@app.on_event("shutdown")
+async def shutdown_event():
+    await genshin_client.__aexit__(None, None, None)
+    await hsr_client.__aexit__(None, None, None)
+    await zzz_client.__aexit__(None, None, None)
+    print("[SHUTDOWN] Enka clients closed.")
 
-    async with fetch_locks[key]:
-        # Kiểm tra lại cache sau khi đợi lock
-        if key in cache_data and now - cache_data[key]["time"] < ttl:
-            print(f"[CACHE] {game.upper()} UID {uid} trả từ cache sau lock")
-            return cache_data[key]["data"]
-
-        client = await get_client(game)
-        start = time.time()
-        try:
-            data = await client.fetch_showcase(uid)  # Không giới hạn thời gian chờ
-        except enka.errors.NotFound:
-            raise HTTPException(status_code=404, detail=f"UID {uid} not found on Enka")
-        except Exception as e:
-            # Nếu có cache thì trả cache cũ
-            if key in cache_data:
-                print(f"[ERROR] {e} → dùng cache cũ cho {uid}")
-                return cache_data[key]["data"]
-            # Không có cache → trả lỗi 502 (lỗi upstream)
-            raise HTTPException(status_code=502, detail=f"Enka API error: {str(e)}")
-
-        elapsed = round(time.time() - start, 3)
-        print(f"[FETCH] {game.upper()} UID {uid} fetched in {elapsed}s")
-
-        cache_data[key] = {"data": data, "time": time.time()}
-        return data
-
-# ===== Nhận diện game =====
+# ==================== UTILS ====================
 def detect_game(uid: int):
     s = str(uid)
     if s.startswith("6") and len(s) == 9:
@@ -107,26 +70,56 @@ def detect_game(uid: int):
         return "gi"
     return None
 
-# ===== Preload =====
-@app.on_event("startup")
-async def warmup():
-    asyncio.create_task(preload_clients_background())
+async def fetch_with_retry(client_func, uid: int, game: str):
+    """Fetch showcase với retry + cache fallback"""
+    last_error = None
+    for attempt in range(1, RETRY_COUNT + 2):  # lần cuối là lần thật sự cuối
+        try:
+            start = time.time()
+            data = await client_func(uid)
+            elapsed = round(time.time() - start, 3)
+            print(f"[FETCH] {game.upper()} UID {uid} in {elapsed}s (try {attempt})")
+            return data
+        except enka.errors.APIRequestTimeoutError as e:
+            print(f"[TIMEOUT] {game.upper()} UID {uid} (try {attempt})")
+            last_error = e
+        except Exception as e:
+            print(f"[ERROR] {game.upper()} UID {uid} (try {attempt}) {e}")
+            last_error = e
+    raise last_error
 
-async def preload_clients_background():
-    preload_uids = [
-        ("gi", 800000000),
-        ("hsr", 600000000),
-        ("zzz", 100000000)
-    ]
-    await asyncio.sleep(1)
-    print("[PRELOAD] Start preloading assets...")
-    try:
-        await asyncio.gather(*[fetch_showcase(game, uid) for game, uid in preload_uids])
-        print("[PRELOAD] Completed")
-    except Exception as e:
-        print(f"[PRELOAD] Error: {e}")
+async def fetch_showcase(game: str, uid: int):
+    key = f"{game}:{uid}"
+    ttl = CACHE_TTL.get(game, 300)
+    now = time.time()
 
-# ===== API =====
+    # Cache còn hạn → trả ngay
+    if key in cache_data and now - cache_data[key]["time"] < ttl:
+        return cache_data[key]["data"]
+
+    async with fetch_locks[key]:
+        # Kiểm tra lại cache sau khi chờ lock
+        if key in cache_data and now - cache_data[key]["time"] < ttl:
+            return cache_data[key]["data"]
+
+        client_map = {
+            "gi": genshin_client.fetch_showcase,
+            "hsr": hsr_client.fetch_showcase,
+            "zzz": zzz_client.fetch_showcase
+        }
+
+        try:
+            data = await fetch_with_retry(client_map[game], uid, game)
+            cache_data[key] = {"data": data, "time": time.time()}
+            return data
+        except Exception as e:
+            # Nếu lỗi nhưng cache cũ còn → trả cache
+            if key in cache_data:
+                print(f"[FALLBACK CACHE] {game.upper()} UID {uid}")
+                return cache_data[key]["data"]
+            raise HTTPException(status_code=500, detail=str(e))
+
+# ==================== ROUTES ====================
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "Enka backend is running"}
@@ -156,21 +149,22 @@ async def get_hsr(uid: int):
 async def get_zzz(uid: int):
     return (await fetch_showcase("zzz", uid)).model_dump()
 
-# ===== API Identity V =====
+# ==================== IDENTITY V API ====================
 @app.get("/idv/{roleid}")
 async def get_idv(roleid: int):
     url = "https://pay.neteasegames.com/gameclub/identityv/2001/login-role"
     params = {"roleid": roleid, "client_type": "gameclub"}
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-    try:
-        start = time.time()
-        response = await httpx_client.get(url, params=params, headers=headers)  # không timeout
-        response.raise_for_status()
-        elapsed = round(time.time() - start, 3)
-        print(f"[IDV] RoleID {roleid} fetched in {elapsed}s")
-        return response.json()
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Identity V API error: {str(e)}")
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            start = time.time()
+            response = await client.get(url, params=params, headers=headers)
+            response.raise_for_status()
+            elapsed = round(time.time() - start, 3)
+            print(f"[IDV] RoleID {roleid} in {elapsed}s")
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=500, detail=f"Request error: {str(e)}")
