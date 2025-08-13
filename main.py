@@ -204,8 +204,13 @@ async def get_enka(game: str, uid: int):
 
 @app.get("/idv/{roleid}")
 async def get_idv(roleid: int):
-    if not idv_client:
-        raise HTTPException(status_code=500, detail="HTTP client not initialized")
+    key = f"idv:{roleid}"
+    ttl = 300  # 5 phút
+
+    # Check cache
+    cached = await redis_client.get(key)
+    if cached:
+        return json.loads(cached)
 
     url = "https://pay.neteasegames.com/gameclub/identityv/2001/login-role"
     params = {"roleid": roleid, "client_type": "gameclub"}
@@ -217,7 +222,13 @@ async def get_idv(roleid: int):
         response.raise_for_status()
         elapsed = round(time.time() - start, 3)
         print(f"[IDV] RoleID {roleid} in {elapsed}s")
-        return response.json()
+
+        data = response.json()
+
+        # Lưu cache
+        await redis_client.setex(key, ttl, json.dumps(data))
+
+        return data
     except httpx.HTTPStatusError as e:
         raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
     except httpx.RequestError as e:
