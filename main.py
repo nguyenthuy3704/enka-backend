@@ -1,9 +1,8 @@
 import asyncio
-import time
-import json
 import os
+import json
+import time
 import uvloop
-uvloop.install()
 
 from collections import defaultdict
 from fastapi import FastAPI, HTTPException, Request
@@ -12,9 +11,12 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import PlainTextResponse
 import enka
 import httpx
-import redis.asyncio as redis  # Redis async client
+import redis.asyncio as redis
 
 # ==================== CONFIG ====================
+
+uvloop.install()
+
 CACHE_TTL = {
     "gi": 300,   # 5 phút
     "hsr": 300,  # 5 phút
@@ -34,9 +36,12 @@ PRELOAD_UIDS = [
     ("zzz", 100000000)
 ]
 
-REDIS_URL = os.getenv("REDIS_URL")  # Lấy từ biến môi trường Render
+REDIS_URL = os.getenv("REDIS_URL")
+if not REDIS_URL:
+    raise RuntimeError("REDIS_URL environment variable is not set!")
 
-# ==================== APP ====================
+# ==================== APP SETUP ====================
+
 app = FastAPI(redirect_slashes=False)
 
 # CORS
@@ -51,12 +56,13 @@ app.add_middleware(
 # GZip
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-# ==================== GLOBALS ====================
+# ==================== GLOBAL CLIENTS ====================
+
 genshin_client = enka.GenshinClient(enka.gi.Language.ENGLISH)
 hsr_client = enka.HSRClient(enka.hsr.Language.ENGLISH)
 zzz_client = enka.ZZZClient(enka.zzz.Language.ENGLISH)
 
-idv_client = httpx.AsyncClient(timeout=15)
+idv_client: httpx.AsyncClient | None = None
 
 redis_client = redis.from_url(
     REDIS_URL,
@@ -67,43 +73,38 @@ redis_client = redis.from_url(
 fetch_locks = defaultdict(asyncio.Lock)
 
 # ==================== STARTUP / SHUTDOWN ====================
+
 @app.on_event("startup")
-async def startup_event():
-    # Kết nối Enka
+async def on_startup():
+    global idv_client
+    idv_client = httpx.AsyncClient(timeout=15)
+
     await genshin_client.__aenter__()
     await hsr_client.__aenter__()
     await zzz_client.__aenter__()
 
-    # Test Redis
     try:
         pong = await redis_client.ping()
         print(f"[REDIS] Connected: {pong}")
     except Exception as e:
         print(f"[REDIS] Connection failed: {e}")
 
-    # Preload
     asyncio.create_task(preload_showcases(PRELOAD_UIDS))
     print("[STARTUP] Enka clients ready.")
 
 @app.on_event("shutdown")
-async def shutdown_event():
+async def on_shutdown():
     await genshin_client.__aexit__(None, None, None)
     await hsr_client.__aexit__(None, None, None)
     await zzz_client.__aexit__(None, None, None)
-    await idv_client.aclose()
+
+    if idv_client:
+        await idv_client.aclose()
+
     await redis_client.aclose()
     print("[SHUTDOWN] All clients closed.")
 
 # ==================== UTILS ====================
-def detect_game(uid: int):
-    s = str(uid)
-    if s.startswith("6") and len(s) == 9:
-        return "hsr"
-    elif s.startswith("1") and len(s) == 9:
-        return "zzz"
-    elif len(s) == 9:
-        return "gi"
-    return None
 
 async def fetch_with_retry(client_func, uid: int, game: str):
     last_error = None
@@ -130,17 +131,16 @@ async def fetch_showcase(game: str, uid: int):
     cached_json = await redis_client.get(key)
     if cached_json:
         try:
-            data_dict = json.loads(cached_json)
-            return enka.models.Showcase(**data_dict)
+            return json.loads(cached_json)
         except Exception:
             print(f"[CACHE ERROR] {key} parse failed, refetching...")
 
     async with fetch_locks[key]:
+        # Double check cache trong lock
         cached_json = await redis_client.get(key)
         if cached_json:
             try:
-                data_dict = json.loads(cached_json)
-                return enka.models.Showcase(**data_dict)
+                return json.loads(cached_json)
             except Exception:
                 pass
 
@@ -152,23 +152,26 @@ async def fetch_showcase(game: str, uid: int):
 
         try:
             data = await fetch_with_retry(client_map[game], uid, game)
-            await redis_client.setex(key, ttl, json.dumps(data.model_dump()))
-            return data
+            data_dict = data.model_dump()
+            await redis_client.setex(key, ttl, json.dumps(data_dict))
+            return data_dict
         except Exception as e:
             if cached_json:
                 print(f"[FALLBACK CACHE] {key}")
-                return enka.models.Showcase(**json.loads(cached_json))
+                return json.loads(cached_json)
             raise HTTPException(status_code=500, detail=str(e))
 
 async def preload_showcases(uid_list):
-    for game, uid in uid_list:
-        try:
-            await fetch_showcase(game, uid)
+    tasks = [fetch_showcase(game, uid) for game, uid in uid_list]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for (game, uid), res in zip(uid_list, results):
+        if isinstance(res, Exception):
+            print(f"[PRELOAD] {game.upper()} {uid} FAILED: {res}")
+        else:
             print(f"[PRELOAD] {game.upper()} {uid} OK")
-        except Exception as e:
-            print(f"[PRELOAD] {game.upper()} {uid} FAILED: {e}")
 
 # ==================== ROUTES ====================
+
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "Enka backend is running"}
@@ -179,28 +182,31 @@ async def ping(request: Request):
         return PlainTextResponse(status_code=200)
     return PlainTextResponse("pong", status_code=200)
 
-@app.get("/enka/{uid}")
-async def get_enka(uid: int):
-    game = detect_game(uid)
-    if not game:
-        raise HTTPException(status_code=400, detail="Unknown UID format")
-    return (await fetch_showcase(game, uid)).model_dump()
-
 @app.get("/gi/{uid}")
 async def get_gi(uid: int):
-    return (await fetch_showcase("gi", uid)).model_dump()
+    return await fetch_showcase("gi", uid)
 
 @app.get("/hsr/{uid}")
 async def get_hsr(uid: int):
-    return (await fetch_showcase("hsr", uid)).model_dump()
+    return await fetch_showcase("hsr", uid)
 
 @app.get("/zzz/{uid}")
 async def get_zzz(uid: int):
-    return (await fetch_showcase("zzz", uid)).model_dump()
+    return await fetch_showcase("zzz", uid)
+
+@app.get("/enka/{game}/{uid}")
+async def get_enka(game: str, uid: int):
+    if game not in CACHE_TTL:
+        raise HTTPException(status_code=400, detail="Unknown game")
+    return await fetch_showcase(game, uid)
 
 # ==================== IDENTITY V API ====================
+
 @app.get("/idv/{roleid}")
 async def get_idv(roleid: int):
+    if not idv_client:
+        raise HTTPException(status_code=500, detail="HTTP client not initialized")
+
     url = "https://pay.neteasegames.com/gameclub/identityv/2001/login-role"
     params = {"roleid": roleid, "client_type": "gameclub"}
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
