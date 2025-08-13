@@ -27,3 +27,4 @@ flask
 gunicorn
 httpx
 uvloop
+httptools
