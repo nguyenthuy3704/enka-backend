@@ -177,11 +177,32 @@ async def preload_showcases(uid_list):
 async def root():
     return {"status": "ok", "message": "Enka backend is running"}
 
-@app.api_route("/ping", methods=["GET", "HEAD"], include_in_schema=False)
-async def ping(request: Request):
-    if request.method == "HEAD":
-        return PlainTextResponse(status_code=200)
-    return PlainTextResponse("pong", status_code=200)
+from datetime import datetime
+import platform
+import psutil  # pip install psutil
+
+START_TIME = time.time()
+
+@app.get("/ping", include_in_schema=False)
+async def ping():
+    uptime = round(time.time() - START_TIME, 2)
+
+    return {
+        "status": "ok",
+        "message": "pong",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "uptime_seconds": uptime,
+        "system": {
+            "python": platform.python_version(),
+            "platform": platform.system(),
+            "release": platform.release(),
+        },
+        "metrics": {
+            "cpu_percent": psutil.cpu_percent(interval=0.2),
+            "memory_percent": psutil.virtual_memory().percent,
+        }
+    }
+
 
 @app.get("/gi/{uid}")
 async def get_gi(uid: int):
