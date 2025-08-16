@@ -29,4 +29,6 @@ httpx
 uvloop
 httptools
 redis[asyncio]
+psutil
+
 
